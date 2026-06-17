@@ -1,0 +1,186 @@
+{
+  "description": "BI Triage Operator — Power Automate flow template. Triggers on new email to shared mailbox, calls Claude API, replies with triage decision.",
+  "version": "1.0",
+  "parameters": {
+    "ANTHROPIC_API_KEY": {
+      "description": "Your Anthropic API key. Store in Azure Key Vault or Power Automate environment variables — never hardcode.",
+      "type": "securestring",
+      "defaultValue": ""
+    },
+    "SHARED_MAILBOX": {
+      "description": "The shared mailbox address that receives BI requests (e.g., bi-requests@yourcompany.com)",
+      "type": "string",
+      "defaultValue": "bi-requests@yourcompany.com"
+    },
+    "OPERATOR_SYSTEM_PROMPT": {
+      "description": "Paste the combined contents of identity.md + rules.md + config.md here.",
+      "type": "string",
+      "defaultValue": "REPLACE_WITH_OPERATOR_FILES"
+    },
+    "CLAUDE_MODEL": {
+      "description": "Claude model to use for triage.",
+      "type": "string",
+      "defaultValue": "claude-sonnet-4-6"
+    },
+    "REPLY_TO_EMAIL": {
+      "description": "Set to true to reply to the original email thread. Set to false to only log to Teams/SharePoint.",
+      "type": "bool",
+      "defaultValue": true
+    },
+    "TEAMS_CHANNEL_ID": {
+      "description": "Optional. Teams channel ID to post triage decisions. Leave empty to skip.",
+      "type": "string",
+      "defaultValue": ""
+    },
+    "INTERNAL_DOMAIN": {
+      "description": "Your company email domain for filtering internal senders (e.g., yourcompany.com)",
+      "type": "string",
+      "defaultValue": "yourcompany.com"
+    }
+  },
+  "flow": {
+    "trigger": {
+      "type": "When a new email arrives in a shared mailbox (V2)",
+      "inputs": {
+        "mailboxAddress": "@parameters('SHARED_MAILBOX')",
+        "folderPath": "Inbox",
+        "includeAttachments": false,
+        "importance": "Any"
+      }
+    },
+    "actions": {
+      "Filter_internal_senders": {
+        "type": "Condition",
+        "description": "Only process emails from internal senders. Prevents spam and auto-replies from triggering triage.",
+        "expression": {
+          "and": [
+            {
+              "contains": [
+                "@triggerOutputs()?['body/from']",
+                "@parameters('INTERNAL_DOMAIN')"
+              ]
+            },
+            {
+              "not": {
+                "startsWith": [
+                  "@triggerOutputs()?['body/subject']",
+                  "RE:"
+                ]
+              }
+            },
+            {
+              "not": {
+                "startsWith": [
+                  "@triggerOutputs()?['body/subject']",
+                  "Automatic reply"
+                ]
+              }
+            }
+          ]
+        },
+        "actions": {
+          "Compose_user_message": {
+            "type": "Compose",
+            "description": "Build the formatted request string to send to Claude.",
+            "inputs": "From: @{triggerOutputs()?['body/from']}\nChannel: Email\nSubject: @{triggerOutputs()?['body/subject']}\nReceived: @{triggerOutputs()?['body/receivedDateTime']}\nRequest:\n@{substring(triggerOutputs()?['body/body'], 0, min(length(triggerOutputs()?['body/body']), 3000))}"
+          },
+          "Call_Claude_API": {
+            "type": "Http",
+            "description": "POST the request to the Claude API with operator files as system context.",
+            "inputs": {
+              "method": "POST",
+              "uri": "https://api.anthropic.com/v1/messages",
+              "headers": {
+                "x-api-key": "@parameters('ANTHROPIC_API_KEY')",
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+              },
+              "body": {
+                "model": "@parameters('CLAUDE_MODEL')",
+                "max_tokens": 1024,
+                "system": "@parameters('OPERATOR_SYSTEM_PROMPT')",
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "@outputs('Compose_user_message')"
+                  }
+                ]
+              }
+            }
+          },
+          "Parse_Claude_response": {
+            "type": "ParseJSON",
+            "description": "Extract the triage decision card text from the Claude API response.",
+            "inputs": {
+              "content": "@body('Call_Claude_API')",
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "content": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "type": { "type": "string" },
+                        "text": { "type": "string" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "Extract_decision_card": {
+            "type": "Compose",
+            "description": "Pull the triage decision text from the parsed response.",
+            "inputs": "@first(body('Parse_Claude_response')?['content'])?['text']"
+          },
+          "Reply_to_email": {
+            "type": "Reply to an email (V3)",
+            "description": "Send the triage decision card back to the original email thread.",
+            "runAfter": {
+              "Extract_decision_card": ["Succeeded"]
+            },
+            "inputs": {
+              "messageId": "@triggerOutputs()?['body/id']",
+              "mailboxAddress": "@parameters('SHARED_MAILBOX')",
+              "body": {
+                "replyAll": false,
+                "comment": "TRIAGE DECISION — automated via Analytics & Reporting Triage Operator\n\n@{outputs('Extract_decision_card')}\n\n---\nThis decision was generated automatically. Reply to this thread with questions or to provide additional context."
+              }
+            }
+          },
+          "Post_to_Teams_if_configured": {
+            "type": "Condition",
+            "description": "Optionally post the triage decision to a Teams channel for team visibility.",
+            "expression": {
+              "not": {
+                "equals": ["@parameters('TEAMS_CHANNEL_ID')", ""]
+              }
+            },
+            "actions": {
+              "Post_Teams_message": {
+                "type": "Post message in a chat or channel",
+                "inputs": {
+                  "channelId": "@parameters('TEAMS_CHANNEL_ID')",
+                  "message": "**New Triage Decision**\n**Request:** @{triggerOutputs()?['body/subject']}\n**From:** @{triggerOutputs()?['body/from']}\n\n@{outputs('Extract_decision_card')}"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "setup_instructions": [
+    "1. In Power Automate, go to My Flows > Import > Import Package and upload this file.",
+    "2. Map the M365 connection to your account.",
+    "3. Set ANTHROPIC_API_KEY in environment variables (not inline — use Azure Key Vault for production).",
+    "4. Set SHARED_MAILBOX to the inbox where BI requests arrive.",
+    "5. Set INTERNAL_DOMAIN to your company's email domain.",
+    "6. Replace OPERATOR_SYSTEM_PROMPT with the combined text from identity.md + rules.md + config.md.",
+    "7. Optionally set TEAMS_CHANNEL_ID to also post decisions to a Teams channel.",
+    "8. Save and test by sending a sample request email to the shared mailbox.",
+    "9. Check the flow run history to confirm the Claude API call succeeded and the reply was sent."
+  ]
+}
